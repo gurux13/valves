@@ -1,0 +1,629 @@
+/*
+ * SPDX-FileCopyrightText: 2021-2022 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: CC0-1.0
+ *
+ * Zigbee HA_color_dimmable_light Example
+ *
+ * This example code is in the Public Domain (or CC0 licensed, at your option.)
+ *
+ * Unless required by applicable law or agreed to in writing, this
+ * software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+ * CONDITIONS OF ANY KIND, either express or implied.
+ */
+
+#include "esp_zb_light.h"
+#include "esp_check.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/ledc.h"
+#include "ha/esp_zigbee_ha_standard.h"
+#include "driver/gpio.h"
+#include "pinout.h"
+#include "driver/gptimer_etm.h"
+#include "driver/gptimer.h"
+#include "esp_timer.h"
+#include <thread>
+#include <esp_zigbee_core.h>
+
+#if !defined CONFIG_ZB_ZCZR
+#error Define ZB_ZCZR in idf.py menuconfig to compile light (Router) source code.
+#endif
+#include <esp_pthread.h>
+#include <string.h>
+
+#define LEDC_TIMER LEDC_TIMER_0
+#define LEDC_MODE LEDC_LOW_SPEED_MODE
+#define LEDC_OUTPUT_IO (11) // Define the output GPIO
+#define LEDC_CHANNEL LEDC_CHANNEL_0
+#define LEDC_DUTY_RES LEDC_TIMER_8_BIT // Set duty resolution to 13 bits
+#define LEDC_DUTY (4096)               // Set duty to 50%. (2 ** 13) * 50% = 4096
+#define LEDC_FREQUENCY (20000)         // Frequency in Hertz. Set frequency at 4 kHz
+#define BUTTON_DEBOUNCE 10000
+#define BUTTON_LONG_PRESS 1500000
+#define BUTTON_LONG_PRESS_TICK 500000
+#define SONAR_LONG_PRESS 700000
+
+/**
+ * @brief Zigbee HA standard color dimmable light device default config value.
+ *
+ */
+#define ESP_ZB_DIMMABLE_LIGHT_CONFIG()                                                  \
+    {                                                                                   \
+        .basic_cfg =                                                                    \
+            {                                                                           \
+                .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,              \
+                .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,            \
+            },                                                                          \
+        .identify_cfg =                                                                 \
+            {                                                                           \
+                .identify_time = ESP_ZB_ZCL_IDENTIFY_IDENTIFY_TIME_DEFAULT_VALUE,       \
+            },                                                                          \
+        .groups_cfg =                                                                   \
+            {                                                                           \
+                .groups_name_support_id = ESP_ZB_ZCL_GROUPS_NAME_SUPPORT_DEFAULT_VALUE, \
+            },                                                                          \
+        .scenes_cfg =                                                                   \
+            {                                                                           \
+                .scenes_count = ESP_ZB_ZCL_SCENES_SCENE_COUNT_DEFAULT_VALUE,            \
+                .current_scene = ESP_ZB_ZCL_SCENES_CURRENT_SCENE_DEFAULT_VALUE,         \
+                .current_group = ESP_ZB_ZCL_SCENES_CURRENT_GROUP_DEFAULT_VALUE,         \
+                .scene_valid = ESP_ZB_ZCL_SCENES_SCENE_VALID_DEFAULT_VALUE,             \
+                .name_support = ESP_ZB_ZCL_SCENES_NAME_SUPPORT_DEFAULT_VALUE,           \
+            },                                                                          \
+        .on_off_cfg =                                                                   \
+            {                                                                           \
+                .on_off = ESP_ZB_ZCL_ON_OFF_ON_OFF_DEFAULT_VALUE,                       \
+            },                                                                          \
+        .level_cfg =                                                                    \
+            {                                                                           \
+                .current_level = ESP_ZB_ZCL_LEVEL_CONTROL_CURRENT_LEVEL_DEFAULT_VALUE,  \
+            },                                                                          \
+    }
+
+static const char *TAG = "ESP_ZB_COLOR_DIMM_LIGHT";
+static bool should_factory_reset = false;
+
+static void example_ledc_init(void)
+{
+    // Prepare and then apply the LEDC PWM timer configuration
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_MODE,
+        .duty_resolution = LEDC_DUTY_RES,
+        .timer_num = LEDC_TIMER,
+        .freq_hz = LEDC_FREQUENCY, // Set output frequency at 4 kHz
+        .clk_cfg = LEDC_AUTO_CLK,
+        .deconfigure = false};
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    // Prepare and then apply the LEDC PWM channel configuration
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num = PIN_LED,
+        .speed_mode = LEDC_MODE,
+        .channel = LEDC_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER,
+        .duty = 0, // Set duty to 0%
+        .hpoint = 0,
+        .flags = 0};
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    gpio_set_drive_capability(PIN_LED, GPIO_DRIVE_CAP_3);
+}
+
+
+static void reportAttribute(uint16_t clusterID, uint16_t attributeID, void *value)
+{
+    esp_zb_zcl_report_attr_cmd_t cmd = {};
+    cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+    cmd.zcl_basic_cmd.dst_endpoint = HA_COLOR_DIMMABLE_LIGHT_ENDPOINT;
+    cmd.zcl_basic_cmd.src_endpoint = HA_COLOR_DIMMABLE_LIGHT_ENDPOINT;
+    cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+    cmd.clusterID = clusterID;
+    cmd.attributeID = attributeID;
+    cmd.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_set_attribute_val(HA_COLOR_DIMMABLE_LIGHT_ENDPOINT, clusterID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, attributeID, value, false);
+    esp_zb_zcl_report_attr_cmd_req(&cmd);
+    esp_zb_lock_release();
+}
+uint8_t current_light_level = 0;
+esp_err_t zb_update_light_status()
+{
+
+    ESP_LOGI(TAG, "Updating light status to %d in zb", current_light_level);
+    /* Update pressure attribute */
+
+    bool status = current_light_level != 0;
+
+    reportAttribute(ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, 0, &status);
+    reportAttribute(ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL, 0, &current_light_level);
+    return ESP_OK;
+}
+static void set_light_level(bool internally_initiated)
+{
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, current_light_level);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    light_driver_set_level((uint8_t)current_light_level);
+    ESP_LOGI(TAG, "Light level changes to %d", current_light_level);
+
+    static uint8_t last_level = 0;
+    if (last_level != current_light_level && internally_initiated)
+    {
+        ESP_EARLY_LOGI(TAG, "Send command for moving light to %d level", current_light_level);
+        zb_update_light_status();
+    }
+    last_level = current_light_level;
+}
+
+volatile bool have_light = false;
+bool in_short_distance = false;
+uint64_t entered_short_distance_at = 0;
+bool used_long_hold = false;
+bool increasing = true;
+uint64_t last_exit_short_distance_at = 0;
+uint8_t light_levels_long_hold[] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 255};
+uint8_t light_level_long_hold_idx = 0;
+constexpr uint8_t light_levels_long_hold_size = sizeof(light_levels_long_hold) / sizeof(light_levels_long_hold[0]);
+unsigned long long long_hold_last_tick = 0;
+static void calc_distances()
+{
+    last_distance_agg = last_distance_agg * 0.15 + last_distance * 0.85;
+    auto now = esp_timer_get_time();
+    // background_distance = background_distance * 0.95 + last_distance * 0.05;
+    // ESP_LOGI(TAG, "Distance: %lf, last_distance_agg: %lf ", last_distance, last_distance_agg);
+    double threshold = in_short_distance ? 0.16 : 0.12;
+    if (last_distance_agg < threshold)
+    {
+        if (now - last_exit_short_distance_at < 500000)
+        {
+            return;
+        }
+        if (!in_short_distance)
+        {
+            ESP_LOGI(TAG, "Touch detected");
+            used_long_hold = false;
+            in_short_distance = true;
+            entered_short_distance_at = esp_timer_get_time();
+        }
+        else
+        {
+            if (esp_timer_get_time() - entered_short_distance_at > SONAR_LONG_PRESS)
+            {
+                // ESP_LOGI(TAG, "Long touch detected");
+                used_long_hold = true;
+                if (now - long_hold_last_tick > BUTTON_LONG_PRESS_TICK || long_hold_last_tick == 0)
+                {
+                    long_hold_last_tick = now;
+                    toggle_light_long_press();
+                }
+            }
+        }
+    }
+    else
+    {
+        if (in_short_distance)
+        {
+            ESP_LOGI(TAG, "Touch released");
+            last_exit_short_distance_at = esp_timer_get_time();
+            in_short_distance = false;
+            entered_short_distance_at = 0;
+            if (!used_long_hold)
+            {
+                ESP_LOGI(TAG, "Short touch -- toggle light");
+                toggle_light_on_press();
+            }
+
+            else
+            {
+                increasing = !increasing;
+            }
+        }
+        in_short_distance = false;
+        entered_short_distance_at = 0;
+    }
+}
+
+void toggle_light_long_press()
+{
+    ++light_level_long_hold_idx;
+    if (light_level_long_hold_idx >= light_levels_long_hold_size)
+    {
+        light_level_long_hold_idx = 0;
+    }
+    current_light_level = light_levels_long_hold[light_level_long_hold_idx];
+    set_light_level(true);
+}
+
+void toggle_light_on_press()
+{
+    if (current_light_level == 0)
+    {
+        current_light_level = 255;
+        light_level_long_hold_idx = light_levels_long_hold_size - 1;
+    }
+    else
+    {
+        current_light_level = 0;
+        light_level_long_hold_idx = 0;
+    }
+
+    set_light_level(true);
+}
+static long long last_long_tick = 0;
+static void *button_thread(void *ignored)
+{
+    while (1)
+    {
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        auto now = esp_timer_get_time();
+        auto is_pressed = gpio_get_level(PIN_BUTTON) == 0;
+        // ESP_LOGI(TAG, "Button state: %d", is_pressed);
+        if (is_pressed)
+        {
+            if (last_button_pressed_at == 0)
+            {
+                last_button_pressed_at = now;
+                last_button_released_at = 0;
+                continue;
+            }
+            if (now - last_button_pressed_at < BUTTON_DEBOUNCE)
+            {
+                continue;
+            }
+            if (last_button_pressed_at != 0 && now - last_button_pressed_at > BUTTON_LONG_PRESS)
+            { // holding for a long time
+                if (last_long_tick == 0)
+                {
+                    ESP_LOGI(TAG, "Long button press detected");
+
+                    last_long_tick = now;
+                    toggle_light_long_press();
+                }
+                else if (now - last_long_tick > BUTTON_LONG_PRESS_TICK)
+                {
+                    ESP_LOGI(TAG, "Long button TICK detected");
+
+                    last_long_tick = now;
+                    toggle_light_long_press();
+                }
+                continue;
+            }
+        }
+        else
+        {
+            last_long_tick = 0;
+
+            if (last_button_pressed_at != 0)
+            {
+                ESP_LOGI(TAG, "Button released, held for %lldms", (now - last_button_pressed_at) / 1000);
+                if (now - last_button_pressed_at < BUTTON_DEBOUNCE)
+                {
+                    ESP_LOGI(TAG, "Debouncing");
+                    last_button_released_at = 0;
+                    last_button_pressed_at = 0;
+                    continue;
+                }
+
+                last_button_released_at = esp_timer_get_time();
+                if (now - last_button_pressed_at < BUTTON_LONG_PRESS)
+                {
+                    ESP_LOGI(TAG, "Short button press detected");
+                    toggle_light_on_press();
+                }
+                last_button_pressed_at = 0;
+            }
+        }
+    }
+}
+
+static void *sonar_thread(void *ignored)
+{
+    gptimer_handle_t gptimer = NULL;
+    gptimer_config_t timer_config = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 1 * 1000 * 1000, // 1MHz, 1 tick = 1us
+        .intr_priority = 0,
+        .flags = 0,
+    };
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
+    gptimer_alarm_config_t alarm_config = {
+        .alarm_count = 0,
+        .reload_count = 0,
+        .flags = 0,
+    };
+    alarm_config.alarm_count = 1 * 1000; // alarm target = 1 ms @resolution 1MHz
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
+
+    gptimer_event_callbacks_t cbs = {0};
+    cbs.on_alarm = on_sonar_timer; // register user callback
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, nullptr));
+    ESP_ERROR_CHECK(gptimer_enable(gptimer));
+
+    while (1)
+    {
+        gpio_set_level(PIN_SONAR_TRIGGER, 1);
+        is_rising = false;
+        ESP_ERROR_CHECK(gptimer_start(gptimer));
+
+        // ESP_LOGI(TAG, "Triggering sonar");
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        if (!have_light)
+        {
+            continue;
+        }
+        calc_distances();
+        // light_driver_set_level((uint8_t)(last_distance));
+        // printf("%lf\n", last_distance);
+        // ESP_LOGI(TAG, "Count: %d", count);
+    }
+}
+
+static void sonar_init()
+{
+    ESP_ERROR_CHECK(gpio_reset_pin(PIN_SONAR_ECHO));
+    ESP_ERROR_CHECK(gpio_set_direction(PIN_SONAR_ECHO, GPIO_MODE_INPUT));
+    ESP_ERROR_CHECK(gpio_reset_pin(PIN_BUTTON));
+    ESP_ERROR_CHECK(gpio_set_direction(PIN_BUTTON, GPIO_MODE_INPUT));
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_SONAR_ECHO, on_echo_edge, nullptr));
+    ESP_ERROR_CHECK(gpio_set_intr_type(PIN_SONAR_ECHO, GPIO_INTR_ANYEDGE));
+    gpio_reset_pin(PIN_SONAR_TRIGGER);
+    gpio_set_level(PIN_SONAR_TRIGGER, 1);
+    gpio_set_direction(PIN_SONAR_TRIGGER, GPIO_MODE_OUTPUT);
+    gpio_dump_io_configuration(stdout, 1ULL << 4 | 1ULL << 5 | 1ULL << 11);
+    pthread_t t1;
+
+    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+    cfg.stack_size = (4 * 1024);
+    esp_pthread_set_cfg(&cfg);
+
+    pthread_create(&t1, NULL, sonar_thread, NULL);
+}
+
+/********************* Define functions **************************/
+static esp_err_t deferred_driver_init(void)
+{
+    light_driver_init(LIGHT_DEFAULT_OFF);
+    have_light = true;
+    // periph_module_enable(PERIPH_LEDC_MODULE);
+    return ESP_OK;
+}
+
+static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
+{
+    ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) == ESP_OK, , TAG, "Failed to start Zigbee commissioning");
+}
+volatile bool is_connected_anew = false;
+void *blinker_thread(void *ignored)
+{
+    while (!is_connected_anew)
+    {
+        current_light_level = 0;
+        set_light_level(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        current_light_level = 32;
+        set_light_level(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    return NULL;
+}
+void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
+{
+    uint32_t *p_sg_p = signal_struct->p_app_signal;
+    esp_err_t err_status = signal_struct->esp_err_status;
+    esp_zb_app_signal_type_t sig_type = (esp_zb_app_signal_type_t)*p_sg_p;
+    switch (sig_type)
+    {
+        case ESP_ZB_NLME_STATUS_INDICATION:
+        {
+            if (err_status == ESP_OK)
+            {
+                is_connected_anew = true;
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Failed to get network status: %s", esp_err_to_name(err_status));
+            }
+            break;
+        }
+    case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
+        ESP_LOGI(TAG, "Initialize Zigbee stack");
+        esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_INITIALIZATION);
+        break;
+    case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
+    case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
+        if (err_status == ESP_OK)
+        {
+            ESP_LOGI(TAG, "Deferred driver initialization %s", deferred_driver_init() ? "failed" : "successful");
+            ESP_LOGI(TAG, "Device started up in %s factory-reset mode", esp_zb_bdb_is_factory_new() ? "" : "non");
+            if (esp_zb_bdb_is_factory_new())
+            {
+                ESP_LOGI(TAG, "Start network steering");
+                esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+                pthread_t t2;
+
+                esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+                cfg.stack_size = (4 * 1024);
+                esp_pthread_set_cfg(&cfg);
+
+                pthread_create(&t2, NULL, blinker_thread, NULL);                
+            }
+            else
+            {
+                if (should_factory_reset)
+                {
+                    ESP_LOGI(TAG, "Factory reset Zigbee stack");
+                    esp_zb_factory_reset();
+                }
+                ESP_LOGI(TAG, "Device rebooted");
+            }
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)", esp_err_to_name(err_status));
+        }
+        break;
+    case ESP_ZB_BDB_SIGNAL_STEERING:
+        if (err_status == ESP_OK)
+        {
+            is_connected_anew = true;
+            esp_zb_ieee_addr_t extended_pan_id;
+            esp_zb_get_extended_pan_id(extended_pan_id);
+            ESP_LOGI(TAG, "Joined network successfully (Extended PAN ID: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x, PAN ID: 0x%04hx, Channel:%d, Short Address: 0x%04hx)",
+                     extended_pan_id[7], extended_pan_id[6], extended_pan_id[5], extended_pan_id[4],
+                     extended_pan_id[3], extended_pan_id[2], extended_pan_id[1], extended_pan_id[0],
+                     esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
+            esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+        }
+        break;
+    case ESP_ZB_NWK_SIGNAL_PERMIT_JOIN_STATUS:
+        if (err_status == ESP_OK)
+        {
+            if (*(uint8_t *)esp_zb_app_signal_get_params(p_sg_p))
+            {
+                ESP_LOGI(TAG, "Network(0x%04hx) is open for %d seconds", esp_zb_get_pan_id(), *(uint8_t *)esp_zb_app_signal_get_params(p_sg_p));
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Network(0x%04hx) closed, devices joining not allowed.", esp_zb_get_pan_id());
+            }
+        }
+        break;
+    default:
+        ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s", esp_zb_zdo_signal_to_string(sig_type), sig_type, esp_err_to_name(err_status));
+        break;
+    }
+}
+
+static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
+{
+    esp_err_t ret = ESP_OK;
+    bool light_state = 0;
+    uint8_t light_level = 0;
+    ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty message");
+    ESP_RETURN_ON_FALSE(message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG, "Received message: error status(%d)",
+                        message->info.status);
+    ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d)", message->info.dst_endpoint, message->info.cluster,
+             message->attribute.id, message->attribute.data.size);
+    if (message->info.dst_endpoint == HA_COLOR_DIMMABLE_LIGHT_ENDPOINT)
+    {
+        switch (message->info.cluster)
+        {
+        case ESP_ZB_ZCL_CLUSTER_ID_ON_OFF:
+            if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL)
+            {
+                light_state = message->attribute.data.value ? *(bool *)message->attribute.data.value : light_state;
+                ESP_LOGI(TAG, "Light sets to %s", light_state ? "On" : "Off");
+                current_light_level = light_state ? 255 : 0;
+                set_light_level(false);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "On/Off cluster data: attribute(0x%x), type(0x%x)", message->attribute.id, message->attribute.data.type);
+            }
+            break;
+        case ESP_ZB_ZCL_CLUSTER_ID_COLOR_CONTROL:
+
+            break;
+        case ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL:
+            if (message->attribute.id == ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U8)
+            {
+                light_level = message->attribute.data.value ? *(uint8_t *)message->attribute.data.value : light_level;
+                current_light_level = light_level;
+                set_light_level(false);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Level Control cluster data: attribute(0x%x), type(0x%x)", message->attribute.id, message->attribute.data.type);
+            }
+            break;
+        default:
+            ESP_LOGI(TAG, "Message data: cluster(0x%x), attribute(0x%x)  ", message->info.cluster, message->attribute.id);
+        }
+    }
+    return ret;
+}
+
+static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message)
+{
+    esp_err_t ret = ESP_OK;
+    switch (callback_id)
+    {
+    case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
+        ret = zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)message);
+        break;
+    default:
+        ESP_LOGW(TAG, "Receive Zigbee action(0x%x) callback", callback_id);
+        break;
+    }
+    return ret;
+}
+
+char mfg[128];
+char model[128];
+
+static void esp_zb_task(void *pvParameters)
+{
+    esp_zb_set_trace_level_mask(ESP_ZB_TRACE_LEVEL_CRITICAL, 0);
+    /* initialize Zigbee stack */
+    esp_zb_cfg_t zb_nwk_cfg; // = ESP_ZB_ZR_CONFIG();
+    zb_nwk_cfg.esp_zb_role = ESP_ZB_DEVICE_TYPE_ROUTER;
+    zb_nwk_cfg.install_code_policy = INSTALLCODE_POLICY_ENABLE;
+    zb_nwk_cfg.nwk_cfg.zczr_cfg = {
+        .max_children = MAX_CHILDREN};
+    esp_zb_init(&zb_nwk_cfg);
+
+    esp_zb_color_dimmable_light_cfg_t light_cfg = ESP_ZB_DIMMABLE_LIGHT_CONFIG();
+    esp_zb_ep_list_t *esp_zb_color_dimmable_light_ep = esp_zb_color_dimmable_light_ep_create(HA_COLOR_DIMMABLE_LIGHT_ENDPOINT, &light_cfg);
+    strncpy(mfg + 1, ESP_MANUFACTURER_NAME, sizeof(mfg) - 1);
+    mfg[0] = strlen(ESP_MANUFACTURER_NAME);
+    strncpy(model + 1, ESP_MODEL_IDENTIFIER, sizeof(model) - 1);
+    model[0] = strlen(ESP_MODEL_IDENTIFIER);
+    zcl_basic_manufacturer_info_t info = {
+        .manufacturer_name = mfg,
+        .model_identifier = model,
+    };
+
+    esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_color_dimmable_light_ep, HA_COLOR_DIMMABLE_LIGHT_ENDPOINT, &info);
+
+    ESP_ERROR_CHECK(esp_zb_device_register(esp_zb_color_dimmable_light_ep));
+    esp_zb_core_action_handler_register(zb_action_handler);
+    ESP_ERROR_CHECK(esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK));
+    ESP_ERROR_CHECK(esp_zb_start(false));
+    esp_zb_stack_main_loop();
+}
+
+extern "C" void app_main(void)
+{
+    sonar_init();
+    if (gpio_get_level(PIN_BUTTON) == 0)
+    {
+        ESP_LOGI(TAG, "Button is pressed on boot");
+        should_factory_reset = true;
+    }
+    pthread_t t1;
+
+    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+    cfg.stack_size = (4 * 1024);
+    esp_pthread_set_cfg(&cfg);
+
+    pthread_create(&t1, NULL, button_thread, NULL);
+
+    example_ledc_init();
+    esp_zb_platform_config_t config = {
+        .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
+        .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
+    };
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_zb_platform_config(&config));
+    xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
+}
