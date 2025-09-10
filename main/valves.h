@@ -8,7 +8,7 @@ class Valves {
     Valves(const Valves&) = delete;
     Valves& operator=(const Valves&) = delete;
     
-    std::vector<Valve*> valves;
+    std::array<Valve, 3> valves;
 
     void on_state_change(Valve::State new_state, Valve& valve);
     std::thread step_thread;
@@ -26,5 +26,5 @@ public:
     void init();
     void step() ;
     Valve& get_valve(ValveId id);
-    const std::vector<Valve*>& get_all_valves();
+    const std::array<Valve, 3>& get_all_valves();
 };

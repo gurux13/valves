@@ -13,7 +13,7 @@
  */
 
 #include "esp_zigbee_core.h"
-#include "light_driver.h"
+// #include "light_driver.h"
 // #include "iot_light.h"
 #include "zcl_utility.h"
 
@@ -26,7 +26,7 @@
 
 /* Basic manufacturer information */
 #define ESP_MANUFACTURER_NAME "gurux13"      /* Customized manufacturer name */
-#define ESP_MODEL_IDENTIFIER "KitchenLedLeft" /* Customized model identifier */
+#define ESP_MODEL_IDENTIFIER "Valves" /* Customized model identifier */
 #define ESP_FW_VERSION "0.42" /* Customized model identifier */
 
 #define ESP_ZB_ZR_CONFIG()                                                              \
@@ -48,6 +48,3 @@
         .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE,   \
     }
 
-static void toggle_light_on_press();
-
-static void toggle_light_long_press();

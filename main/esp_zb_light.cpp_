@@ -34,17 +34,6 @@
 #include <esp_pthread.h>
 #include <string.h>
 
-#define LEDC_TIMER LEDC_TIMER_0
-#define LEDC_MODE LEDC_LOW_SPEED_MODE
-#define LEDC_OUTPUT_IO (11) // Define the output GPIO
-#define LEDC_CHANNEL LEDC_CHANNEL_0
-#define LEDC_DUTY_RES LEDC_TIMER_8_BIT // Set duty resolution to 13 bits
-#define LEDC_DUTY (4096)               // Set duty to 50%. (2 ** 13) * 50% = 4096
-#define LEDC_FREQUENCY (20000)         // Frequency in Hertz. Set frequency at 4 kHz
-#define BUTTON_DEBOUNCE 10000
-#define BUTTON_LONG_PRESS 1500000
-#define BUTTON_LONG_PRESS_TICK 500000
-#define SONAR_LONG_PRESS 700000
 
 /**
  * @brief Zigbee HA standard color dimmable light device default config value.
@@ -85,32 +74,6 @@
 
 static const char *TAG = "ESP_ZB_COLOR_DIMM_LIGHT";
 static bool should_factory_reset = false;
-
-static void example_ledc_init(void)
-{
-    // Prepare and then apply the LEDC PWM timer configuration
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode = LEDC_MODE,
-        .duty_resolution = LEDC_DUTY_RES,
-        .timer_num = LEDC_TIMER,
-        .freq_hz = LEDC_FREQUENCY, // Set output frequency at 4 kHz
-        .clk_cfg = LEDC_AUTO_CLK,
-        .deconfigure = false};
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-
-    // Prepare and then apply the LEDC PWM channel configuration
-    ledc_channel_config_t ledc_channel = {
-        .gpio_num = PIN_LED,
-        .speed_mode = LEDC_MODE,
-        .channel = LEDC_CHANNEL,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = LEDC_TIMER,
-        .duty = 0, // Set duty to 0%
-        .hpoint = 0,
-        .flags = 0};
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
-    gpio_set_drive_capability(PIN_LED, GPIO_DRIVE_CAP_3);
-}
 
 
 static void reportAttribute(uint16_t clusterID, uint16_t attributeID, void *value)
@@ -167,232 +130,7 @@ uint8_t light_levels_long_hold[] = {0, 1, 2, 4, 8, 16, 32, 64, 128, 255};
 uint8_t light_level_long_hold_idx = 0;
 constexpr uint8_t light_levels_long_hold_size = sizeof(light_levels_long_hold) / sizeof(light_levels_long_hold[0]);
 unsigned long long long_hold_last_tick = 0;
-static void calc_distances()
-{
-    last_distance_agg = last_distance_agg * 0.15 + last_distance * 0.85;
-    auto now = esp_timer_get_time();
-    // background_distance = background_distance * 0.95 + last_distance * 0.05;
-    // ESP_LOGI(TAG, "Distance: %lf, last_distance_agg: %lf ", last_distance, last_distance_agg);
-    double threshold = in_short_distance ? 0.16 : 0.12;
-    if (last_distance_agg < threshold)
-    {
-        if (now - last_exit_short_distance_at < 500000)
-        {
-            return;
-        }
-        if (!in_short_distance)
-        {
-            ESP_LOGI(TAG, "Touch detected");
-            used_long_hold = false;
-            in_short_distance = true;
-            entered_short_distance_at = esp_timer_get_time();
-        }
-        else
-        {
-            if (esp_timer_get_time() - entered_short_distance_at > SONAR_LONG_PRESS)
-            {
-                // ESP_LOGI(TAG, "Long touch detected");
-                used_long_hold = true;
-                if (now - long_hold_last_tick > BUTTON_LONG_PRESS_TICK || long_hold_last_tick == 0)
-                {
-                    long_hold_last_tick = now;
-                    toggle_light_long_press();
-                }
-            }
-        }
-    }
-    else
-    {
-        if (in_short_distance)
-        {
-            ESP_LOGI(TAG, "Touch released");
-            last_exit_short_distance_at = esp_timer_get_time();
-            in_short_distance = false;
-            entered_short_distance_at = 0;
-            if (!used_long_hold)
-            {
-                ESP_LOGI(TAG, "Short touch -- toggle light");
-                toggle_light_on_press();
-            }
 
-            else
-            {
-                increasing = !increasing;
-            }
-        }
-        in_short_distance = false;
-        entered_short_distance_at = 0;
-    }
-}
-
-void toggle_light_long_press()
-{
-    ++light_level_long_hold_idx;
-    if (light_level_long_hold_idx >= light_levels_long_hold_size)
-    {
-        light_level_long_hold_idx = 0;
-    }
-    current_light_level = light_levels_long_hold[light_level_long_hold_idx];
-    set_light_level(true);
-}
-
-void toggle_light_on_press()
-{
-    if (current_light_level == 0)
-    {
-        current_light_level = 255;
-        light_level_long_hold_idx = light_levels_long_hold_size - 1;
-    }
-    else
-    {
-        current_light_level = 0;
-        light_level_long_hold_idx = 0;
-    }
-
-    set_light_level(true);
-}
-static long long last_long_tick = 0;
-static void *button_thread(void *ignored)
-{
-    while (1)
-    {
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-        auto now = esp_timer_get_time();
-        auto is_pressed = gpio_get_level(PIN_BUTTON) == 0;
-        // ESP_LOGI(TAG, "Button state: %d", is_pressed);
-        if (is_pressed)
-        {
-            if (last_button_pressed_at == 0)
-            {
-                last_button_pressed_at = now;
-                last_button_released_at = 0;
-                continue;
-            }
-            if (now - last_button_pressed_at < BUTTON_DEBOUNCE)
-            {
-                continue;
-            }
-            if (last_button_pressed_at != 0 && now - last_button_pressed_at > BUTTON_LONG_PRESS)
-            { // holding for a long time
-                if (last_long_tick == 0)
-                {
-                    ESP_LOGI(TAG, "Long button press detected");
-
-                    last_long_tick = now;
-                    toggle_light_long_press();
-                }
-                else if (now - last_long_tick > BUTTON_LONG_PRESS_TICK)
-                {
-                    ESP_LOGI(TAG, "Long button TICK detected");
-
-                    last_long_tick = now;
-                    toggle_light_long_press();
-                }
-                continue;
-            }
-        }
-        else
-        {
-            last_long_tick = 0;
-
-            if (last_button_pressed_at != 0)
-            {
-                ESP_LOGI(TAG, "Button released, held for %lldms", (now - last_button_pressed_at) / 1000);
-                if (now - last_button_pressed_at < BUTTON_DEBOUNCE)
-                {
-                    ESP_LOGI(TAG, "Debouncing");
-                    last_button_released_at = 0;
-                    last_button_pressed_at = 0;
-                    continue;
-                }
-
-                last_button_released_at = esp_timer_get_time();
-                if (now - last_button_pressed_at < BUTTON_LONG_PRESS)
-                {
-                    ESP_LOGI(TAG, "Short button press detected");
-                    toggle_light_on_press();
-                }
-                last_button_pressed_at = 0;
-            }
-        }
-    }
-}
-
-static void *sonar_thread(void *ignored)
-{
-    gptimer_handle_t gptimer = NULL;
-    gptimer_config_t timer_config = {
-        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-        .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1 * 1000 * 1000, // 1MHz, 1 tick = 1us
-        .intr_priority = 0,
-        .flags = 0,
-    };
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
-    gptimer_alarm_config_t alarm_config = {
-        .alarm_count = 0,
-        .reload_count = 0,
-        .flags = 0,
-    };
-    alarm_config.alarm_count = 1 * 1000; // alarm target = 1 ms @resolution 1MHz
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
-
-    gptimer_event_callbacks_t cbs = {0};
-    cbs.on_alarm = on_sonar_timer; // register user callback
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, nullptr));
-    ESP_ERROR_CHECK(gptimer_enable(gptimer));
-
-    while (1)
-    {
-        gpio_set_level(PIN_SONAR_TRIGGER, 1);
-        is_rising = false;
-        ESP_ERROR_CHECK(gptimer_start(gptimer));
-
-        // ESP_LOGI(TAG, "Triggering sonar");
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-        if (!have_light)
-        {
-            continue;
-        }
-        calc_distances();
-        // light_driver_set_level((uint8_t)(last_distance));
-        // printf("%lf\n", last_distance);
-        // ESP_LOGI(TAG, "Count: %d", count);
-    }
-}
-
-static void sonar_init()
-{
-    ESP_ERROR_CHECK(gpio_reset_pin(PIN_SONAR_ECHO));
-    ESP_ERROR_CHECK(gpio_set_direction(PIN_SONAR_ECHO, GPIO_MODE_INPUT));
-    ESP_ERROR_CHECK(gpio_reset_pin(PIN_BUTTON));
-    ESP_ERROR_CHECK(gpio_set_direction(PIN_BUTTON, GPIO_MODE_INPUT));
-    ESP_ERROR_CHECK(gpio_install_isr_service(0));
-    ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_SONAR_ECHO, on_echo_edge, nullptr));
-    ESP_ERROR_CHECK(gpio_set_intr_type(PIN_SONAR_ECHO, GPIO_INTR_ANYEDGE));
-    gpio_reset_pin(PIN_SONAR_TRIGGER);
-    gpio_set_level(PIN_SONAR_TRIGGER, 1);
-    gpio_set_direction(PIN_SONAR_TRIGGER, GPIO_MODE_OUTPUT);
-    gpio_dump_io_configuration(stdout, 1ULL << 4 | 1ULL << 5 | 1ULL << 11);
-    pthread_t t1;
-
-    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
-    cfg.stack_size = (4 * 1024);
-    esp_pthread_set_cfg(&cfg);
-
-    pthread_create(&t1, NULL, sonar_thread, NULL);
-}
-
-/********************* Define functions **************************/
-static esp_err_t deferred_driver_init(void)
-{
-    light_driver_init(LIGHT_DEFAULT_OFF);
-    have_light = true;
-    // periph_module_enable(PERIPH_LEDC_MODULE);
-    return ESP_OK;
-}
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
@@ -567,7 +305,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     }
     return ret;
 }
-
+*/
 char mfg[128];
 char model[128];
 

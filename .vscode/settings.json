@@ -72,7 +72,8 @@
         "thread": "cpp",
         "cinttypes": "cpp",
         "typeinfo": "cpp",
-        "variant": "cpp"
+        "variant": "cpp",
+        "*.cpp_": "cpp"
     },
     "idf.espIdfPathWin": "C:\\Users\\gurux\\esp\\v5.5\\esp-idf",
     "idf.toolsPathWin": "C:\\Users\\gurux\\.espressif",
