@@ -2177,7 +2177,7 @@ CONFIG_ZB_RADIO_NATIVE=y
 # CONFIG_ZB_GP_ENABLED is not set
 # end of Zigbee Example
 
-CONFIG_ZB_DEBUG_MODE=y
+# CONFIG_ZB_DEBUG_MODE is not set
 # end of Zigbee
 # end of Component config
 

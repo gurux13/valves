@@ -16,12 +16,13 @@
 #include <esp_zigbee_core.h>
 #include "esp_zb_light.h"
 #include "zboss_api.h"
+#include "valves.h"
 char mfg[128];
 char model[128];
 
 static const char *TAG = "Zigbee";
 volatile bool is_connected_anew = false;
-static bool should_factory_reset = true;
+static bool should_factory_reset = false;
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
@@ -40,42 +41,35 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
     ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d), data type(%d)", message->info.dst_endpoint,
         message->info.cluster, message->attribute.id, message->attribute.data.size, message->attribute.data.type);
 
-    if (message->info.dst_endpoint == 10) {
+    if (message->info.dst_endpoint > 0 && message->info.dst_endpoint < 4) {
         switch (message->info.cluster) {
         case ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY:
             ESP_LOGI(TAG, "Identify pressed");
             break;
 
-        // case ESP_ZB_ZCL_CLUSTER_ID_ON_OFF:
-        //     if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID
-        //         && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL
-        //         && message->attribute.data.value != NULL)
-        //             light_set_on_off(*(bool *)message->attribute.data.value);
+        case ESP_ZB_ZCL_CLUSTER_ID_ON_OFF:
+            if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID
+                && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL
+                && message->attribute.data.value != NULL) {
+                    auto value = *(bool *)message->attribute.data.value;
+                    auto& valve = Valves::get_instance().get_valve(static_cast<Valves::ValveId>(message->info.dst_endpoint - 1));
+                    if (value) {
+                        ESP_LOGI(TAG, "Valve %d: OPEN", message->info.dst_endpoint);
+                        valve.open();
+                    }
+                    else {
+                        ESP_LOGI(TAG, "Valve %d: CLOSED", message->info.dst_endpoint);
+                        valve.close();
+                    }
+                    
+                }
 
-        //     if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_START_UP_ON_OFF
-        //         && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_8BIT_ENUM
-        //         && message->attribute.data.value != NULL)
-        //             light_set_startup_on_off(*(uint8_t *)message->attribute.data.value);
-        //     break;
+            // if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_START_UP_ON_OFF
+            //     && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_8BIT_ENUM
+            //     && message->attribute.data.value != NULL)
+            //         light_set_startup_on_off(*(uint8_t *)message->attribute.data.value);
+            break;
 
-        // case ESP_ZB_ZCL_CLUSTER_ID_LEVEL_CONTROL:
-        //     if (message->attribute.id == ESP_ZB_ZCL_ATTR_LEVEL_CONTROL_CURRENT_LEVEL_ID
-        //         && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U8
-        //         && message->attribute.data.value != NULL)
-        //             light_set_level(*(uint8_t *)message->attribute.data.value);
-        //     break;
-
-        // case ESP_ZB_ZCL_CLUSTER_ID_COLOR_CONTROL:
-        //     if (message->attribute.id == ESP_ZB_ZCL_ATTR_COLOR_CONTROL_COLOR_TEMPERATURE_ID
-        //         && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U16
-        //         && message->attribute.data.value != NULL)
-        //             light_set_temperature(*(uint16_t *)message->attribute.data.value);
-
-        //     if (message->attribute.id == ESP_ZB_ZCL_ATTR_COLOR_CONTROL_START_UP_COLOR_TEMPERATURE_MIREDS_ID
-        //         && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_U16
-        //         && message->attribute.data.value != NULL)
-        //             light_set_startup_temperature(*(uint16_t *)message->attribute.data.value);
-        //     break;
         }
     }
 
@@ -200,95 +194,13 @@ static char manufacturer_name[16];
 static char firmware_version[16];
 #define FIRMWARE_VERSION                "v1.0"
 
-static void esp_zb_task(void *pvParameters)
-{
-
-    //     esp_zb_color_dimmable_light_cfg_t light_cfg = ESP_ZB_DEFAULT_COLOR_DIMMABLE_LIGHT_CONFIG();
-    // light_cfg.basic_cfg.power_source = ZB_ZCL_BASIC_POWER_SOURCE_DC_SOURCE;
-    // light_cfg.color_cfg.color_mode = ZB_ZCL_COLOR_CONTROL_COLOR_MODE_TEMPERATURE;
-    // light_cfg.color_cfg.color_capabilities = ZB_ZCL_COLOR_CONTROL_CAPABILITIES_COLOR_TEMP;
-
-    // esp_zb_set_trace_level_mask(ESP_ZB_TRACE_LEVEL_CRITICAL, 0);
-    // /* initialize Zigbee stack */
-    // esp_zb_cfg_t zb_nwk_cfg; // = ESP_ZB_ZR_CONFIG();
-    // zb_nwk_cfg.esp_zb_role = ESP_ZB_DEVICE_TYPE_ROUTER;
-    // zb_nwk_cfg.install_code_policy = INSTALLCODE_POLICY_ENABLE;
-    // zb_nwk_cfg.nwk_cfg.zczr_cfg = {
-    //     .max_children = MAX_CHILDREN};
-    // esp_zb_init(&zb_nwk_cfg);
-
-    // esp_zb_ep_list_t *esp_zb_color_dimmable_light_ep = esp_zb_ep_list_create();
-
-    // esp_zb_on_off_switch_cfg_t config = ESP_ZB_DEFAULT_ON_OFF_SWITCH_CONFIG();
-    
-    // auto cluster_list = esp_zb_zcl_cluster_list_create();
-    // esp_zb_basic_cluster_cfg_s basic_cfg = {
-    //     .zcl_version = 3,
-    //     .power_source = ZB_ZCL_BASIC_POWER_SOURCE_DC_SOURCE};
-    // set_zcl_string(model_id, ESP_MODEL_IDENTIFIER);
-    // set_zcl_string(manufacturer_name, ESP_MANUFACTURER_NAME);
-    // set_zcl_string(firmware_version, FIRMWARE_VERSION);
-    // esp_zb_attribute_list_t *esp_zb_basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
-    // esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, model_id);
-    // esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, manufacturer_name);
-    // esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_SW_BUILD_ID, firmware_version);
-    // esp_zb_cluster_list_add_basic_cluster(cluster_list, esp_zb_basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    // esp_zb_endpoint_config_t endpoint_config = {.endpoint = HA_COLOR_DIMMABLE_LIGHT_ENDPOINT,
-    //                                             .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-    //                                             .app_device_id = ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID,
-    //                                             .app_device_version = 0};
-    // uint8_t default_on_off = ZB_ZCL_ON_OFF_START_UP_ON_OFF_IS_ON;
-    // esp_zb_attribute_list_t *esp_zb_ep_on_off_cluster = esp_zb_on_off_cluster_create(&light_cfg.on_off_cfg);
-    // esp_zb_on_off_cluster_add_attr(esp_zb_ep_on_off_cluster, ESP_ZB_ZCL_ATTR_ON_OFF_START_UP_ON_OFF, &default_on_off);
-    // esp_zb_cluster_list_add_on_off_cluster(cluster_list, esp_zb_ep_on_off_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    // esp_zb_ep_list_add_ep(esp_zb_color_dimmable_light_ep, cluster_list, endpoint_config);
-
-    // // strncpy(mfg + 1, ESP_MANUFACTURER_NAME, sizeof(mfg) - 1);
-    // // mfg[0] = strlen(ESP_MANUFACTURER_NAME);
-    // // strncpy(model + 1, ESP_MODEL_IDENTIFIER, sizeof(model) - 1);
-    // // model[0] = strlen(ESP_MODEL_IDENTIFIER);
-    // // zcl_basic_manufacturer_info_t info = {
-    // //     .manufacturer_name = mfg,
-    // //     .model_identifier = model,
-    // // };
-
-    // // esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_color_dimmable_light_ep, HA_COLOR_DIMMABLE_LIGHT_ENDPOINT, &info);
-
-    // ESP_ERROR_CHECK(esp_zb_device_register(esp_zb_color_dimmable_light_ep));
-    // esp_zb_core_action_handler_register(zb_action_handler);
-    // ESP_ERROR_CHECK(esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK));
-    // ESP_ERROR_CHECK(esp_zb_start(false));
-    // esp_zb_stack_main_loop();
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    esp_zb_cfg_t zb_nwk_cfg; // = ESP_ZB_ZR_CONFIG();
-    zb_nwk_cfg.esp_zb_role = ESP_ZB_DEVICE_TYPE_ROUTER;
-    zb_nwk_cfg.install_code_policy = INSTALLCODE_POLICY_ENABLE;
-    zb_nwk_cfg.nwk_cfg.zczr_cfg = {
-        .max_children = MAX_CHILDREN};
-    esp_zb_init(&zb_nwk_cfg);
-
-    esp_zb_color_dimmable_light_cfg_t light_cfg = ESP_ZB_DEFAULT_COLOR_DIMMABLE_LIGHT_CONFIG();
-    light_cfg.basic_cfg.power_source = ZB_ZCL_BASIC_POWER_SOURCE_DC_SOURCE;
-    light_cfg.color_cfg.color_mode = ZB_ZCL_COLOR_CONTROL_COLOR_MODE_TEMPERATURE;
-    light_cfg.color_cfg.color_capabilities = ZB_ZCL_COLOR_CONTROL_CAPABILITIES_COLOR_TEMP;
-
-    esp_zb_attribute_list_t *esp_zb_basic_cluster = esp_zb_basic_cluster_create(&light_cfg.basic_cfg);
+static void make_valve_endpoint(uint8_t id, esp_zb_ep_list_t *ep_list) {
+    esp_zb_basic_cluster_cfg_t basic_cfg = 
+        {
+            .zcl_version = 3,
+            .power_source = ZB_ZCL_BASIC_POWER_SOURCE_DC_SOURCE
+        };
+    esp_zb_attribute_list_t *esp_zb_basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
     set_zcl_string(model_id, ESP_MODEL_IDENTIFIER);
     set_zcl_string(manufacturer_name, ESP_MANUFACTURER_NAME);
     set_zcl_string(firmware_version, FIRMWARE_VERSION);
@@ -296,16 +208,21 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, manufacturer_name);
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_SW_BUILD_ID, firmware_version);
 
-    esp_zb_attribute_list_t *esp_zb_identify_cluster = esp_zb_identify_cluster_create(&light_cfg.identify_cfg);
-    esp_zb_attribute_list_t *esp_zb_ep_groups_cluster = esp_zb_groups_cluster_create(&light_cfg.groups_cfg);
-    esp_zb_attribute_list_t *esp_zb_ep_scenes_cluster = esp_zb_scenes_cluster_create(&light_cfg.scenes_cfg);
+    esp_zb_identify_cluster_cfg_t identify_cfg = {
+        .identify_time = 0
+    };
+    esp_zb_attribute_list_t *esp_zb_identify_cluster = esp_zb_identify_cluster_create(&identify_cfg);
+    esp_zb_groups_cluster_cfg_t groups_cfg = {};
+    esp_zb_attribute_list_t *esp_zb_ep_groups_cluster = esp_zb_groups_cluster_create(&groups_cfg);
+    esp_zb_scenes_cluster_cfg_t scenes_cfg = {};
+    esp_zb_attribute_list_t *esp_zb_ep_scenes_cluster = esp_zb_scenes_cluster_create(&scenes_cfg);
 
-    uint8_t default_on_off = ZB_ZCL_ON_OFF_START_UP_ON_OFF_IS_ON;
-    esp_zb_attribute_list_t *esp_zb_ep_on_off_cluster = esp_zb_on_off_cluster_create(&light_cfg.on_off_cfg);
+    uint8_t default_on_off = ZB_ZCL_ON_OFF_START_UP_ON_OFF_IS_OFF;
+    esp_zb_on_off_cluster_cfg_t on_off_cfg = {
+        .on_off = false
+    };
+    esp_zb_attribute_list_t *esp_zb_ep_on_off_cluster = esp_zb_on_off_cluster_create(&on_off_cfg);
     esp_zb_on_off_cluster_add_attr(esp_zb_ep_on_off_cluster, ESP_ZB_ZCL_ATTR_ON_OFF_START_UP_ON_OFF, &default_on_off);
-
-    esp_zb_attribute_list_t *esp_zb_ep_level_cluster = esp_zb_level_cluster_create(&light_cfg.level_cfg);
-
 
     esp_zb_cluster_list_t *esp_zb_zcl_cluster_list = esp_zb_zcl_cluster_list_create();
     esp_zb_cluster_list_add_basic_cluster(esp_zb_zcl_cluster_list, esp_zb_basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
@@ -313,44 +230,36 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_cluster_list_add_groups_cluster(esp_zb_zcl_cluster_list, esp_zb_ep_groups_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     esp_zb_cluster_list_add_scenes_cluster(esp_zb_zcl_cluster_list, esp_zb_ep_scenes_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     esp_zb_cluster_list_add_on_off_cluster(esp_zb_zcl_cluster_list, esp_zb_ep_on_off_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    esp_zb_cluster_list_add_level_cluster(esp_zb_zcl_cluster_list, esp_zb_ep_level_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
 
     esp_zb_endpoint_config_t endpoint_config = {
-        .endpoint = 10,
+        .endpoint = id,
         .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id = ESP_ZB_HA_COLOR_DIMMABLE_LIGHT_DEVICE_ID
+        .app_device_id = ESP_ZB_HA_COMBINED_INTERFACE_DEVICE_ID,
     };
+    esp_zb_ep_list_add_ep(ep_list, esp_zb_zcl_cluster_list, endpoint_config);
+}
+
+static void esp_zb_task(void *pvParameters)
+{
+    esp_zb_cfg_t zb_nwk_cfg; // = ESP_ZB_ZR_CONFIG();
+    zb_nwk_cfg.esp_zb_role = ESP_ZB_DEVICE_TYPE_ROUTER;
+    zb_nwk_cfg.install_code_policy = INSTALLCODE_POLICY_ENABLE;
+    zb_nwk_cfg.nwk_cfg.zczr_cfg = {
+        .max_children = MAX_CHILDREN};
+    esp_zb_init(&zb_nwk_cfg);
+
 
     esp_zb_ep_list_t *esp_zb_ep_list = esp_zb_ep_list_create();
-    esp_zb_ep_list_add_ep(esp_zb_ep_list, esp_zb_zcl_cluster_list, endpoint_config);
+    for (uint8_t i = 1; i < 4; i++) {
+        make_valve_endpoint(i, esp_zb_ep_list);
+    }
 
     esp_zb_device_register(esp_zb_ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
     esp_zb_stack_main_loop();
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 }
 
 void init_zigbee()
