@@ -17,12 +17,13 @@
 #include "esp_zb_light.h"
 #include "zboss_api.h"
 #include "valves.h"
+#include "esp_zigbee_attribute.h"
 char mfg[128];
 char model[128];
 
 static const char *TAG = "Zigbee";
 volatile bool is_connected_anew = false;
-static bool should_factory_reset = false;
+static bool should_factory_reset = true;
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
@@ -192,30 +193,34 @@ static void set_zcl_string(char *buffer, const char *value) {
 static char model_id[16];
 static char manufacturer_name[16];
 static char firmware_version[16];
+static char initial_status[16];
+#define CUSTOM_CLUSTER_ID 0xfffe
 #define FIRMWARE_VERSION                "v1.0"
-
-static void make_valve_endpoint(uint8_t id, esp_zb_ep_list_t *ep_list) {
-    esp_zb_basic_cluster_cfg_t basic_cfg = 
+void fill_mandatory_endpoint_clusters(esp_zb_cluster_list_t *esp_zb_zcl_cluster_list)
+{
+#pragma region Basic Cluster
+    esp_zb_basic_cluster_cfg_t basic_cfg =
         {
             .zcl_version = 3,
-            .power_source = ZB_ZCL_BASIC_POWER_SOURCE_DC_SOURCE
-        };
+            .power_source = ZB_ZCL_BASIC_POWER_SOURCE_DC_SOURCE};
     esp_zb_attribute_list_t *esp_zb_basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
-    set_zcl_string(model_id, ESP_MODEL_IDENTIFIER);
-    set_zcl_string(manufacturer_name, ESP_MANUFACTURER_NAME);
-    set_zcl_string(firmware_version, FIRMWARE_VERSION);
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, model_id);
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, manufacturer_name);
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_SW_BUILD_ID, firmware_version);
+    esp_zb_cluster_list_add_basic_cluster(esp_zb_zcl_cluster_list, esp_zb_basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+#pragma endregion
 
+#pragma region Identify Cluster
     esp_zb_identify_cluster_cfg_t identify_cfg = {
-        .identify_time = 0
-    };
+        .identify_time = 0};
     esp_zb_attribute_list_t *esp_zb_identify_cluster = esp_zb_identify_cluster_create(&identify_cfg);
-    esp_zb_groups_cluster_cfg_t groups_cfg = {};
-    esp_zb_attribute_list_t *esp_zb_ep_groups_cluster = esp_zb_groups_cluster_create(&groups_cfg);
-    esp_zb_scenes_cluster_cfg_t scenes_cfg = {};
-    esp_zb_attribute_list_t *esp_zb_ep_scenes_cluster = esp_zb_scenes_cluster_create(&scenes_cfg);
+    esp_zb_cluster_list_add_identify_cluster(esp_zb_zcl_cluster_list, esp_zb_identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+#pragma endregion
+}
+static void make_valve_endpoint(uint8_t id, esp_zb_ep_list_t *ep_list) {
+    esp_zb_cluster_list_t *esp_zb_zcl_cluster_list = esp_zb_zcl_cluster_list_create();
+
+    fill_mandatory_endpoint_clusters(esp_zb_zcl_cluster_list);
 
     uint8_t default_on_off = ZB_ZCL_ON_OFF_START_UP_ON_OFF_IS_OFF;
     esp_zb_on_off_cluster_cfg_t on_off_cfg = {
@@ -223,23 +228,44 @@ static void make_valve_endpoint(uint8_t id, esp_zb_ep_list_t *ep_list) {
     };
     esp_zb_attribute_list_t *esp_zb_ep_on_off_cluster = esp_zb_on_off_cluster_create(&on_off_cfg);
     esp_zb_on_off_cluster_add_attr(esp_zb_ep_on_off_cluster, ESP_ZB_ZCL_ATTR_ON_OFF_START_UP_ON_OFF, &default_on_off);
-
-    esp_zb_cluster_list_t *esp_zb_zcl_cluster_list = esp_zb_zcl_cluster_list_create();
-    esp_zb_cluster_list_add_basic_cluster(esp_zb_zcl_cluster_list, esp_zb_basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    esp_zb_cluster_list_add_identify_cluster(esp_zb_zcl_cluster_list, esp_zb_identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    esp_zb_cluster_list_add_groups_cluster(esp_zb_zcl_cluster_list, esp_zb_ep_groups_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    esp_zb_cluster_list_add_scenes_cluster(esp_zb_zcl_cluster_list, esp_zb_ep_scenes_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     esp_zb_cluster_list_add_on_off_cluster(esp_zb_zcl_cluster_list, esp_zb_ep_on_off_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
+    esp_zb_attribute_list_t *custom_cluster = esp_zb_zcl_attr_list_create(CUSTOM_CLUSTER_ID);
+    esp_zb_custom_cluster_add_custom_attr(custom_cluster, 0, ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY| ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, initial_status);
+    esp_zb_cluster_list_add_custom_cluster(esp_zb_zcl_cluster_list, custom_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
     esp_zb_endpoint_config_t endpoint_config = {
         .endpoint = id,
         .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id = ESP_ZB_HA_COMBINED_INTERFACE_DEVICE_ID,
+        // .app_device_id = ESP_ZB_HA_COMBINED_INTERFACE_DEVICE_ID,
+        .app_device_id = ESP_ZB_HA_CUSTOM_ATTR_DEVICE_ID,
     };
     esp_zb_ep_list_add_ep(ep_list, esp_zb_zcl_cluster_list, endpoint_config);
 }
 
+
+void PrepareZclStrings()
+{
+    set_zcl_string(model_id, ESP_MODEL_IDENTIFIER);
+    set_zcl_string(manufacturer_name, ESP_MANUFACTURER_NAME);
+    set_zcl_string(firmware_version, FIRMWARE_VERSION);
+    set_zcl_string(initial_status, "LOADING");
+}
+static void reportAttribute(uint16_t clusterID, uint16_t attributeID, void *value)
+{
+    esp_zb_zcl_report_attr_cmd_t cmd = {};
+    cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+    cmd.zcl_basic_cmd.dst_endpoint = 1;
+    cmd.zcl_basic_cmd.src_endpoint = 1;
+    cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+    cmd.clusterID = clusterID;
+    cmd.attributeID = attributeID;
+    cmd.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_set_attribute_val(1, clusterID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, attributeID, value, false);
+    esp_zb_zcl_report_attr_cmd_req(&cmd);
+    esp_zb_lock_release();
+}
 static void esp_zb_task(void *pvParameters)
 {
     esp_zb_cfg_t zb_nwk_cfg; // = ESP_ZB_ZR_CONFIG();
@@ -249,6 +275,7 @@ static void esp_zb_task(void *pvParameters)
         .max_children = MAX_CHILDREN};
     esp_zb_init(&zb_nwk_cfg);
 
+    PrepareZclStrings();
 
     esp_zb_ep_list_t *esp_zb_ep_list = esp_zb_ep_list_create();
     for (uint8_t i = 1; i < 4; i++) {
@@ -259,6 +286,11 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
+    while (true) {
+        esp_zb_main_loop_iteration();
+        reportAttribute(CUSTOM_CLUSTER_ID, 0, initial_status);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
     esp_zb_stack_main_loop();
 }
 
