@@ -1,12 +1,9 @@
+#pragma once
 #include "button.h"
 #include <array>
 class Buttons {
 public:
-    enum ButtonId {
-        NORMAL = 0,
-        BYPASS = 1,
-        CLOSE = 2,
-    };
+
     void init();
     static Buttons& instance();
     Button& get(ButtonId id);

@@ -3,16 +3,13 @@
 #include <chrono>
 #include <esp_pthread.h>
 #include "esp_log.h"
-Valves::Valves(): valves{Valve(INLET_VALVE, "Inlet", std::bind(&Valves::on_state_change, this, std::placeholders::_1, std::placeholders::_2)),
-                   Valve(OUTLET_VALVE, "Outlet", std::bind(&Valves::on_state_change, this, std::placeholders::_1, std::placeholders::_2)),
-                   Valve(BYPASS_VALVE, "Bypass", std::bind(&Valves::on_state_change, this, std::placeholders::_1, std::placeholders::_2))} {
+
+Valves::Valves(): valves{Valve(INLET_VALVE, "Inlet", ValveId::INLET),
+                   Valve(OUTLET_VALVE, "Outlet", ValveId::OUTLET),
+                   Valve(BYPASS_VALVE, "Bypass", ValveId::BYPASS)} {
     // valves.push_back(new Valve(INLET_VALVE, "Inlet", std::bind(&Valves::on_state_change, this, std::placeholders::_1, std::placeholders::_2)));
     // valves.push_back(new Valve(OUTLET_VALVE, "Outlet", std::bind(&Valves::on_state_change, this, std::placeholders::_1, std::placeholders::_2)));
     // valves.push_back(new Valve(BYPASS_VALVE, "Bypass", std::bind(&Valves::on_state_change, this, std::placeholders::_1, std::placeholders::_2)));
-}
-
-void Valves::on_state_change(Valve::State new_state, Valve& valve) {
-    // Handle state change (e.g., logging, updating UI)
 }
 
 Valves& Valves::get_instance() {
@@ -31,8 +28,6 @@ void Valves::init() {
     for (auto& valve : valves) {
         valve.init();
     }
-    this->step_thread = std::thread(&Valves::thread_proc, this);
-    this->step_thread.detach();
 }
 
 void Valves::step() {

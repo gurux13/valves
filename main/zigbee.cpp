@@ -18,19 +18,65 @@
 #include "zboss_api.h"
 #include "valves.h"
 #include "esp_zigbee_attribute.h"
+#include "logic.h"
 char mfg[128];
 char model[128];
+#define EP_STATUS 42
+#define EP_SOFTEN 10
+#define EP_BYPASS 11
+#define EP_FULL_CLOSE 12
+#define EP_REBOOT 99
+enum
+{
+    STATUS_UNKNOWN = 0,
+    STATUS_MOVING = 1,
+    STATUS_STOPPED = 2,
+    STATUS_RAW_CONTROL = 3,
+    STATUS_ERROR = 4
+};
 
 static const char *TAG = "Zigbee";
-volatile bool is_connected_anew = false;
-static bool should_factory_reset = true;
-
+static bool should_factory_reset = false;
+volatile static bool logic_notified_connected = false;
+volatile static bool is_connected = false;
+static char model_id[16];
+static char manufacturer_name[16];
+static char firmware_version[16];
+#define CUSTOM_CLUSTER_ID 0xfffe
+#define FIRMWARE_VERSION "v1.0"
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
     ESP_LOGI(TAG, "Restart top level commissioning with mode 0x%x", mode_mask);
     ESP_ERROR_CHECK(esp_zb_bdb_start_top_level_commissioning(mode_mask));
 }
+static Logic *logic_instance = nullptr;
 
+void zb_set_logic(Logic *logic)
+{
+    logic_instance = logic;
+}
+static void reportAttribute(uint16_t endpoint, uint16_t clusterID, uint16_t attributeID, uint8_t value)
+{
+    // ESP_LOGI(TAG, "Reporting attribute %d:0x%04x:0x%04x at %d", endpoint, clusterID, attributeID, value);
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_set_attribute_val(endpoint, clusterID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, attributeID, &value, false);
+    if (clusterID == CUSTOM_CLUSTER_ID || true)
+    {
+        // ESP_LOGI(TAG, "Custom cluster reporting");
+
+        esp_zb_zcl_report_attr_cmd_t cmd = {};
+        cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+        cmd.zcl_basic_cmd.dst_endpoint = 1; // endpoint;
+        cmd.zcl_basic_cmd.src_endpoint = endpoint;
+        cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+
+        cmd.clusterID = clusterID;
+        cmd.attributeID = attributeID;
+        cmd.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+        esp_zb_zcl_report_attr_cmd_req(&cmd);
+    }
+    esp_zb_lock_release();
+}
 
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
 {
@@ -40,38 +86,74 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
     ESP_RETURN_ON_FALSE(message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG, "Received message: error status(%d)",
                         message->info.status);
     ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d), data type(%d)", message->info.dst_endpoint,
-        message->info.cluster, message->attribute.id, message->attribute.data.size, message->attribute.data.type);
+             message->info.cluster, message->attribute.id, message->attribute.data.size, message->attribute.data.type);
 
-    if (message->info.dst_endpoint > 0 && message->info.dst_endpoint < 4) {
-        switch (message->info.cluster) {
-        case ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY:
-            ESP_LOGI(TAG, "Identify pressed");
-            break;
+    switch (message->info.cluster)
+    {
+    case ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY:
+        ESP_LOGI(TAG, "Identify pressed");
+        break;
 
-        case ESP_ZB_ZCL_CLUSTER_ID_ON_OFF:
-            if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID
-                && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL
-                && message->attribute.data.value != NULL) {
-                    auto value = *(bool *)message->attribute.data.value;
-                    auto& valve = Valves::get_instance().get_valve(static_cast<Valves::ValveId>(message->info.dst_endpoint - 1));
-                    if (value) {
-                        ESP_LOGI(TAG, "Valve %d: OPEN", message->info.dst_endpoint);
-                        valve.open();
-                    }
-                    else {
-                        ESP_LOGI(TAG, "Valve %d: CLOSED", message->info.dst_endpoint);
-                        valve.close();
-                    }
-                    
+    case ESP_ZB_ZCL_CLUSTER_ID_ON_OFF:
+        if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL && message->attribute.data.value != NULL)
+        {
+            if (!logic_instance)
+            {
+                ESP_LOGE(TAG, "Logic instance is null!");
+                return ESP_FAIL;
+            }
+            auto value = *(bool *)message->attribute.data.value;
+            auto ep = message->info.dst_endpoint;
+            if (ep == EP_REBOOT && value)
+            {
+                ESP_LOGI(TAG, "Reboot command received via On/Off cluster");
+                std::thread([]()
+                            {
+                    reportAttribute(EP_REBOOT, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, false);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    ESP_LOGI(TAG, "Rebooting now...");
+                    esp_restart(); })
+                    .detach();
+                return ESP_OK;
+            }
+            if (message->info.dst_endpoint < 4)
+            {
+                ESP_LOGI(TAG, "Valve %d set to %s via On/Off cluster", message->info.dst_endpoint, value ? "OPEN" : "CLOSED");
+                logic_instance->on_zigbee_raw(static_cast<ValveId>(ep - 1), value);
+                return ESP_OK;
+            }
+            else if (message->info.dst_endpoint >= 10 && message->info.dst_endpoint <= 12)
+            {
+                if (!value)
+                {
+                    ESP_LOGI(TAG, "Mode endpoint switched to off, moving to raw control");
+                    logic_instance->on_zigbee_normal(ZigbeeState::State::RAW_CONTROL);
+                    return ESP_OK;
                 }
-
-            // if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_START_UP_ON_OFF
-            //     && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_8BIT_ENUM
-            //     && message->attribute.data.value != NULL)
-            //         light_set_startup_on_off(*(uint8_t *)message->attribute.data.value);
-            break;
-
+                switch (ep)
+                {
+                case EP_SOFTEN:
+                    ESP_LOGI(TAG, "Switching to SOFTEN");
+                    logic_instance->on_zigbee_normal(ZigbeeState::State::SOFTEN);
+                    return ESP_OK;
+                case EP_BYPASS:
+                    ESP_LOGI(TAG, "Switching to BYPASS");
+                    logic_instance->on_zigbee_normal(ZigbeeState::State::BYPASS);
+                    return ESP_OK;
+                case EP_FULL_CLOSE:
+                    ESP_LOGI(TAG, "Switching to FULL_CLOSE");
+                    logic_instance->on_zigbee_normal(ZigbeeState::State::FULL_CLOSE);
+                    return ESP_OK;
+                default:
+                    ESP_LOGW(TAG, "Unknown endpoint: %d", ep);
+                    return ESP_FAIL;
+                    break;
+                }
+            }
         }
+        ESP_LOGW(TAG, "Unsupported attribute in On/Off cluster: id(0x%x), type(%d)", message->attribute.id,
+                 message->attribute.data.type);
+        return ESP_FAIL;
     }
 
     return ret;
@@ -88,7 +170,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     {
         if (err_status == ESP_OK)
         {
-            is_connected_anew = true;
+            if (!is_connected && logic_instance && !logic_notified_connected)
+            {
+                logic_notified_connected = true;
+                logic_instance->on_zigbee_connected();
+            }
+            is_connected = true;
             ESP_LOGI(TAG, "Rejoined network successfully (PAN ID: 0x%04hx, Channel:%d, Short Address: 0x%04hx)",
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
         }
@@ -138,7 +225,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err_status == ESP_OK)
         {
-            is_connected_anew = true;
+            if (!is_connected && logic_instance && !logic_notified_connected)
+            {
+                logic_notified_connected = true;
+                logic_instance->on_zigbee_connected();
+            }
+            is_connected = true;
             esp_zb_ieee_addr_t extended_pan_id;
             esp_zb_get_extended_pan_id(extended_pan_id);
             ESP_LOGI(TAG, "Joined network successfully (Extended PAN ID: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x, PAN ID: 0x%04hx, Channel:%d, Short Address: 0x%04hx)",
@@ -179,6 +271,8 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
         ret = zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)message);
         break;
+    case ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID:
+        break;
     default:
         ESP_LOGW(TAG, "Receive Zigbee action(0x%x) callback", callback_id);
         break;
@@ -186,16 +280,12 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     return ret;
 }
 
-static void set_zcl_string(char *buffer, const char *value) {
-    buffer[0] = (char) strlen(value);
+static void set_zcl_string(char *buffer, const char *value)
+{
+    buffer[0] = (char)strlen(value);
     memcpy(buffer + 1, value, buffer[0]);
 }
-static char model_id[16];
-static char manufacturer_name[16];
-static char firmware_version[16];
-static char initial_status[16];
-#define CUSTOM_CLUSTER_ID 0xfffe
-#define FIRMWARE_VERSION                "v1.0"
+
 void fill_mandatory_endpoint_clusters(esp_zb_cluster_list_t *esp_zb_zcl_cluster_list)
 {
 #pragma region Basic Cluster
@@ -217,90 +307,272 @@ void fill_mandatory_endpoint_clusters(esp_zb_cluster_list_t *esp_zb_zcl_cluster_
     esp_zb_cluster_list_add_identify_cluster(esp_zb_zcl_cluster_list, esp_zb_identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 #pragma endregion
 }
-static void make_valve_endpoint(uint8_t id, esp_zb_ep_list_t *ep_list) {
+
+static void make_onoff_endpoint(uint8_t id, esp_zb_ep_list_t *ep_list)
+{
     esp_zb_cluster_list_t *esp_zb_zcl_cluster_list = esp_zb_zcl_cluster_list_create();
 
     fill_mandatory_endpoint_clusters(esp_zb_zcl_cluster_list);
 
     uint8_t default_on_off = ZB_ZCL_ON_OFF_START_UP_ON_OFF_IS_OFF;
     esp_zb_on_off_cluster_cfg_t on_off_cfg = {
-        .on_off = false
-    };
+        .on_off = false};
     esp_zb_attribute_list_t *esp_zb_ep_on_off_cluster = esp_zb_on_off_cluster_create(&on_off_cfg);
     esp_zb_on_off_cluster_add_attr(esp_zb_ep_on_off_cluster, ESP_ZB_ZCL_ATTR_ON_OFF_START_UP_ON_OFF, &default_on_off);
     esp_zb_cluster_list_add_on_off_cluster(esp_zb_zcl_cluster_list, esp_zb_ep_on_off_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
-    esp_zb_attribute_list_t *custom_cluster = esp_zb_zcl_attr_list_create(CUSTOM_CLUSTER_ID);
-    esp_zb_custom_cluster_add_custom_attr(custom_cluster, 0, ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY| ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, initial_status);
-    esp_zb_cluster_list_add_custom_cluster(esp_zb_zcl_cluster_list, custom_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-
     esp_zb_endpoint_config_t endpoint_config = {
         .endpoint = id,
         .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        // .app_device_id = ESP_ZB_HA_COMBINED_INTERFACE_DEVICE_ID,
         .app_device_id = ESP_ZB_HA_CUSTOM_ATTR_DEVICE_ID,
     };
     esp_zb_ep_list_add_ep(ep_list, esp_zb_zcl_cluster_list, endpoint_config);
 }
 
+static void make_valve_endpoint(uint8_t id, esp_zb_ep_list_t *ep_list)
+{
+    esp_zb_cluster_list_t *esp_zb_zcl_cluster_list = esp_zb_zcl_cluster_list_create();
+
+    fill_mandatory_endpoint_clusters(esp_zb_zcl_cluster_list);
+
+    uint8_t default_on_off = ZB_ZCL_ON_OFF_START_UP_ON_OFF_IS_OFF;
+    esp_zb_on_off_cluster_cfg_t on_off_cfg = {
+        .on_off = false};
+    esp_zb_attribute_list_t *esp_zb_ep_on_off_cluster = esp_zb_on_off_cluster_create(&on_off_cfg);
+    esp_zb_on_off_cluster_add_attr(esp_zb_ep_on_off_cluster, ESP_ZB_ZCL_ATTR_ON_OFF_START_UP_ON_OFF, &default_on_off);
+
+    esp_zb_cluster_list_add_on_off_cluster(esp_zb_zcl_cluster_list, esp_zb_ep_on_off_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    esp_zb_attribute_list_t *custom_cluster = esp_zb_zcl_attr_list_create(CUSTOM_CLUSTER_ID);
+    uint8_t initial_status = 0;
+    esp_zb_custom_cluster_add_custom_attr(custom_cluster, 0, ESP_ZB_ZCL_ATTR_TYPE_8BIT, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &initial_status);
+    esp_zb_cluster_list_add_custom_cluster(esp_zb_zcl_cluster_list, custom_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    esp_zb_endpoint_config_t endpoint_config = {
+        .endpoint = id,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_CUSTOM_ATTR_DEVICE_ID,
+        .app_device_version = 1};
+    esp_zb_ep_list_add_ep(ep_list, esp_zb_zcl_cluster_list, endpoint_config);
+}
+
+static void make_status_endpoint(uint8_t id, esp_zb_ep_list_t *ep_list)
+{
+    esp_zb_cluster_list_t *esp_zb_zcl_cluster_list = esp_zb_zcl_cluster_list_create();
+
+    fill_mandatory_endpoint_clusters(esp_zb_zcl_cluster_list);
+
+    esp_zb_attribute_list_t *custom_cluster = esp_zb_zcl_attr_list_create(CUSTOM_CLUSTER_ID);
+    uint8_t initial_status = 0;
+    esp_zb_custom_cluster_add_custom_attr(custom_cluster, 0, ESP_ZB_ZCL_ATTR_TYPE_8BIT, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &initial_status);
+    esp_zb_cluster_list_add_custom_cluster(esp_zb_zcl_cluster_list, custom_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    esp_zb_endpoint_config_t endpoint_config = {
+        .endpoint = id,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_CUSTOM_ATTR_DEVICE_ID,
+    };
+    esp_zb_ep_list_add_ep(ep_list, esp_zb_zcl_cluster_list, endpoint_config);
+}
 
 void PrepareZclStrings()
 {
     set_zcl_string(model_id, ESP_MODEL_IDENTIFIER);
     set_zcl_string(manufacturer_name, ESP_MANUFACTURER_NAME);
     set_zcl_string(firmware_version, FIRMWARE_VERSION);
-    set_zcl_string(initial_status, "LOADING");
 }
-static void reportAttribute(uint16_t clusterID, uint16_t attributeID, void *value)
+
+void zb_report_state(const ZigbeeState &state)
 {
-    esp_zb_zcl_report_attr_cmd_t cmd = {};
-    cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
-    cmd.zcl_basic_cmd.dst_endpoint = 1;
-    cmd.zcl_basic_cmd.src_endpoint = 1;
-    cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-    cmd.clusterID = clusterID;
-    cmd.attributeID = attributeID;
-    cmd.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
-    esp_zb_lock_acquire(portMAX_DELAY);
-    esp_zb_zcl_set_attribute_val(1, clusterID, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, attributeID, value, false);
-    esp_zb_zcl_report_attr_cmd_req(&cmd);
-    esp_zb_lock_release();
+    uint8_t status_value = STATUS_UNKNOWN;
+    int epid = 1;
+    for (const auto &valve_state : {state.rawValues.inlet, state.rawValues.outlet, state.rawValues.bypass})
+    {
+        uint8_t valve_state_to_report = STATUS_UNKNOWN;
+        bool valve_onoff_state = false;
+        switch (valve_state)
+        {
+        case Valve::State::UNKNOWN:
+            valve_state_to_report = STATUS_UNKNOWN;
+            break;
+        case Valve::State::OPENING:
+            valve_onoff_state = false;
+            valve_state_to_report = STATUS_MOVING;
+            break;
+        case Valve::State::CLOSING:
+            valve_onoff_state = true;
+            valve_state_to_report = STATUS_MOVING;
+            break;
+        case Valve::State::OPEN:
+            valve_onoff_state = true;
+            valve_state_to_report = STATUS_STOPPED;
+            break;
+        case Valve::State::CLOSED:
+            valve_onoff_state = false;
+            valve_state_to_report = STATUS_STOPPED;
+            break;
+        case Valve::State::ERROR:
+            valve_state_to_report = STATUS_ERROR;
+            status_value = STATUS_ERROR;
+            break;
+        case Valve::State::INTERMEDIATE:
+            valve_state_to_report = STATUS_STOPPED;
+            break;
+        }
+        reportAttribute(epid, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, valve_onoff_state ? 1 : 0);
+        // ESP_LOGI(TAG, "Reporting valve endpoint %d state %d", epid, valve_state_to_report);
+        reportAttribute(epid, CUSTOM_CLUSTER_ID, 0, valve_state_to_report);
+        epid++;
+    }
+    if (state.transitioning && status_value != STATUS_ERROR)
+    {
+        status_value = STATUS_MOVING;
+    }
+    else
+    {
+        switch (state.state)
+        {
+        case ZigbeeState::State::UNDEFINED:
+            status_value = STATUS_UNKNOWN;
+            break;
+        case ZigbeeState::State::SOFTEN:
+        case ZigbeeState::State::BYPASS:
+        case ZigbeeState::State::FULL_CLOSE:
+            status_value = STATUS_STOPPED;
+            break;
+        case ZigbeeState::State::ERROR:
+            status_value = STATUS_ERROR;
+            break;
+        case ZigbeeState::State::RAW_CONTROL:
+            status_value = STATUS_RAW_CONTROL;
+            break;
+        }
+    }
+    bool soften = (state.state == ZigbeeState::State::SOFTEN);
+    bool bypass = (state.state == ZigbeeState::State::BYPASS);
+    bool full_close = (state.state == ZigbeeState::State::FULL_CLOSE);
+    reportAttribute(EP_SOFTEN, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, soften ? 1 : 0);
+    reportAttribute(EP_BYPASS, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, bypass ? 1 : 0);
+    reportAttribute(EP_FULL_CLOSE, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, full_close ? 1 : 0);
+
+    ESP_LOGI(TAG, "Reporting overall status %d", status_value);
+    reportAttribute(EP_STATUS, CUSTOM_CLUSTER_ID, 0, status_value);
 }
+// void report_attribute_task(void *unused) {
+//     ZigbeeState state;
+//     state.state = ZigbeeState::State::SOFTEN;
+//     state.rawValues.inlet = Valve::State::OPEN;
+//     state.rawValues.outlet = Valve::State::OPEN;
+//     state.rawValues.bypass = Valve::State::CLOSED;
+//     state.transitioning = false;
+//     while (true) {
+//         vTaskDelay(pdMS_TO_TICKS(10000));
+//         if (!esp_zb_bdb_dev_joined()) {
+//             continue;
+//         }
+//         zb_report_state(state);
+//         state.transitioning = !state.transitioning;
+
+//     }
+// }
+
+static void setup_reporting()
+{
+    std::vector<uint8_t> endpoints = {1, 2, 3, EP_SOFTEN, EP_BYPASS, EP_FULL_CLOSE};
+    for (int endpoint : endpoints)
+    {
+        esp_zb_zcl_reporting_info_t reporting_info = {}; // Zero init
+
+        reporting_info.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV;
+        reporting_info.ep = endpoint;
+        reporting_info.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF;
+        reporting_info.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
+
+        reporting_info.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID;
+        reporting_info.dst.endpoint = 1;
+        reporting_info.dst.short_addr = 0x0000;
+
+        reporting_info.u.send_info.min_interval = 0; // Instant
+        reporting_info.u.send_info.max_interval = 300;
+        reporting_info.u.send_info.delta.u8 = 1;
+
+        // Call SDK function
+        esp_zb_lock_acquire(portMAX_DELAY);
+        esp_zb_zcl_update_reporting_info(&reporting_info);
+        esp_zb_lock_release();
+    }
+}
+
 static void esp_zb_task(void *pvParameters)
 {
+    ESP_LOGI(TAG, "Zigbee task started");
     esp_zb_cfg_t zb_nwk_cfg; // = ESP_ZB_ZR_CONFIG();
     zb_nwk_cfg.esp_zb_role = ESP_ZB_DEVICE_TYPE_ROUTER;
     zb_nwk_cfg.install_code_policy = INSTALLCODE_POLICY_ENABLE;
     zb_nwk_cfg.nwk_cfg.zczr_cfg = {
         .max_children = MAX_CHILDREN};
     esp_zb_init(&zb_nwk_cfg);
+    ESP_LOGI(TAG, "Zigbee stack initialized");
 
     PrepareZclStrings();
 
     esp_zb_ep_list_t *esp_zb_ep_list = esp_zb_ep_list_create();
-    for (uint8_t i = 1; i < 4; i++) {
+    for (uint8_t i = 1; i < 4; i++)
+    {
         make_valve_endpoint(i, esp_zb_ep_list);
     }
-
-    esp_zb_device_register(esp_zb_ep_list);
-    esp_zb_core_action_handler_register(zb_action_handler);
-    esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
-    ESP_ERROR_CHECK(esp_zb_start(false));
-    while (true) {
-        esp_zb_main_loop_iteration();
-        reportAttribute(CUSTOM_CLUSTER_ID, 0, initial_status);
-        vTaskDelay(pdMS_TO_TICKS(10));
+    for (uint8_t i = 10; i < 13; ++i)
+    {
+        make_onoff_endpoint(i, esp_zb_ep_list);
     }
+    make_status_endpoint(EP_STATUS, esp_zb_ep_list);
+    make_onoff_endpoint(EP_REBOOT, esp_zb_ep_list);
+    ESP_LOGI(TAG, "Registering device endpoints");
+    esp_zb_device_register(esp_zb_ep_list);
+    ESP_LOGI(TAG, "Registering action handler");
+    esp_zb_core_action_handler_register(zb_action_handler);
+    ESP_LOGI(TAG, "Setting primary channel mask");
+    esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
+    ESP_LOGI(TAG, "Starting Zigbee stack");
+    ESP_ERROR_CHECK(esp_zb_start(false));
+    reportAttribute(EP_REBOOT, ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, 0);
+    ESP_LOGI(TAG, "Zigbee stack started");
+    setup_reporting();
+    // xTaskCreate(report_attribute_task, "attr", 40960, NULL, 5, NULL);
     esp_zb_stack_main_loop();
 }
 
-void init_zigbee()
+void notify_connected_thread()
 {
+    while (!esp_zb_bdb_dev_joined() || !logic_instance)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    if (logic_notified_connected)
+    {
+        return;
+    }
+    logic_notified_connected = true;
+    logic_instance->on_zigbee_connected();
+}
+
+void init_zigbee(bool factory_reset)
+{
+    should_factory_reset = factory_reset;
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
     };
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
+
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
+    std::thread notify_thread(notify_connected_thread);
+    notify_thread.detach();
+}
+
+void factory_reset_zigbee()
+{
+    ESP_LOGI(TAG, "Factory resetting Zigbee stack");
+    esp_zb_factory_reset();
 }

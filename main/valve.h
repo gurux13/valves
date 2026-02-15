@@ -3,6 +3,7 @@
 #include "pinout.h"
 #include <functional>
 #include <mutex>
+#include "ids.h"
 class Valve {
     Valve(const Valve&) = delete;
     Valve& operator=(const Valve&) = delete;
@@ -16,8 +17,7 @@ public:
         INTERMEDIATE,
         ERROR
     };
-    typedef std::function<void(State new_state, Valve& valve)> Callback;
-    Valve(const ValvePins& pins, const std::string& name, Callback callback);
+    Valve(const ValvePins& pins, const std::string& name, ValveId id);
     void init();
     State get_state() const;
     void step();
@@ -25,6 +25,7 @@ public:
     void close();
     void stop();
     std::string get_name() const;
+    inline ValveId get_id() const { return id; }
     inline static std::string state_to_string(State state) {
         switch (state) {
             case State::UNKNOWN: return "UNKNOWN";
@@ -38,10 +39,10 @@ public:
         }
     }
 private:
+    ValveId id;
     const ValvePins& pins;
     const std::string name;
     volatile State state = State::UNKNOWN;
-    Callback callback = nullptr;
     void move(bool open);
     std::recursive_mutex state_mutex;
     uint64_t move_start_time = 0;

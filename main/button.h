@@ -1,16 +1,17 @@
 #pragma once
 #include <functional>
 #include <thread>
-
+#include "ids.h"
 class Button {
 public:
-    Button(int pin);
+    Button(int pin, ButtonId id);
     Button(const Button&) = delete;
     Button& operator=(const Button&) = delete;
-    void set_callback(std::function<void()> callback);
     void init();
+    bool is_pressed();
 private:
     int pin;
-    std::function<void()> callback;
+    ButtonId id;
     std::thread button_thread;
+    bool pressed = false;
 };

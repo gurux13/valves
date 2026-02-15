@@ -5,6 +5,8 @@
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "esp_rtc_time.h"
+#include "logic.h"
+
 constexpr int VALVE_MOVE_TIMEOUT_MS = 10000; // Maximum time to wait for a valve to open/close
 
 void make_output(gpio_num_t pin)
@@ -20,7 +22,7 @@ void make_input(gpio_num_t pin)
     ESP_ERROR_CHECK(gpio_set_direction(pin, GPIO_MODE_INPUT));
 }
 
-Valve::Valve(const ValvePins &pins, const std::string &name, Callback callback) : pins(pins), name(name), callback(callback)
+Valve::Valve(const ValvePins &pins, const std::string &name, ValveId id) : id(id), pins(pins), name(name)
 {
     this->state = State::UNKNOWN;
 }
@@ -31,6 +33,19 @@ void Valve::init()
     make_output(this->pins.drive_open);
     make_input(this->pins.sense_closed);
     make_input(this->pins.sense_open);
+    bool is_closed = gpio_get_level(this->pins.sense_closed) == 0;
+    bool is_open = gpio_get_level(this->pins.sense_open) == 0;
+    if (is_open || is_closed)
+    {
+        if (is_open)
+        {
+            state = State::OPEN;
+        }
+        else if (is_closed)
+        {
+            state = State::CLOSED;
+        }
+    }
 }
 
 Valve::State Valve::get_state() const
@@ -40,6 +55,10 @@ Valve::State Valve::get_state() const
 
 void Valve::step()
 {
+    if (state == State::ERROR)
+    {
+        return;
+    }
     bool should_callback = false;
     State new_state = State::UNKNOWN;
     {
@@ -86,9 +105,9 @@ void Valve::step()
             }
         }
     }
-    if (should_callback && this->callback)
+    if (should_callback)
     {
-        this->callback(this->state, *this);
+        logic_on_valve_state_change(this->get_id(), this->state);
     }
 }
 
@@ -118,10 +137,7 @@ void Valve::move(bool open)
         gpio_set_level(this->pins.drive_open, open ? 1 : 0);
         this->state = open ? State::OPENING : State::CLOSING;
     }
-    if (this->callback)
-    {
-        this->callback(this->state, *this);
-    }
+    logic_on_valve_state_change(this->get_id(), this->state);
 }
 
 void Valve::open()
@@ -149,9 +165,9 @@ void Valve::stop()
             should_callback = true;
         }
     }
-    if (this->callback && should_callback)
+    if (should_callback)
     {
-        this->callback(this->state, *this);
+        logic_on_valve_state_change(this->get_id(), this->state);
     }
 }
 
